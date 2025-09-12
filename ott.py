@@ -1,6 +1,7 @@
 import re
 import csv
 import json
+import sqlite3
 from sys import exit
 from time import sleep, time
 from pathlib import Path
@@ -12,10 +13,8 @@ OTT_RELEASE = "15.1" # See https://files.opentreeoflife.org/synthesis/
 OTT_API_URL = "https://api.opentreeoflife.org/v3"
 OTT_TREE_URL = f'https://files.opentreeoflife.org/synthesis/opentree{OTT_RELEASE}/output/labelled_supertree/labelled_supertree.tre'
 OTT_TREE_FILE = Path(f"tree-{OTT_RELEASE}.tre")
-CLADES_FILE = Path(f"clades-{OTT_RELEASE}.csv")
+DB_FILE = Path(f"taxa-{OTT_RELEASE}.db")
 SCHEMA = ["id", "parent", "name", "extant", "other_names", "description"]
-
-clades = []
 
 def download_tree():
 	# Download the opentreeoflife.org phylogenetic tree of life.
@@ -35,90 +34,92 @@ def download_tree():
 		exit(1) # This is a fatal error.
 
 def process_tree():
-	# Flatten the phylogenetic tree of life into clades.
+	# Flatten the phylogenetic tree of life into a list, one item per taxon.
 	# Data from opentreeoflife.org is formatted as a Newick tree string.
-	# The result is saved to CLADES_FILE in CSV format e.g. clades-15.1.csv
-	# At this point we only have relationships without any details.
 	print("Processing tree")
+	taxa = []
 	tree = Phylo.read(OTT_TREE_FILE, "newick")
 	stack = [(None, tree.root)]
 	while stack:
 		parent, clade = stack.pop()
 		if clade.name:
-			clades.append({"id": clade.name, "parent": parent})
+			taxa.append((clade.name, parent))
 		for child in clade.clades:
 			stack.append((clade.name, child))
+	return taxa
 
-def load_clades():
-	if not CLADES_FILE.exists():
-		return False
-	print(f"Loading {CLADES_FILE}")
-	with open(CLADES_FILE, newline="") as f:
-		for row in csv.DictReader(f):
-			clades.append(row)
-	return True
+def db_exists(conn):
+	return bool(conn.execute("PRAGMA table_info(taxa);").fetchone())
 
-def save_clades():
-	with open(CLADES_FILE, "w", newline="") as file:
-		writer = csv.writer(file)
-		writer.writerow(SCHEMA)
-		writer.writerows([clade.get(k) for k in SCHEMA] for clade in clades)
+def db_create(conn, taxa):
+	# Taxa list is saved to a SQLite3 database at DB_FILE e.g. taxa-15.1.db
+	# At this point we only have relationships without any details.
+	# Table creation will rollback if an exception is raised inside the "with" block.
+	print("Creating database")
+	with conn:
+		conn.execute("""
+			CREATE TABLE IF NOT EXISTS taxa (
+				id     TEXT PRIMARY KEY,
+				parent TEXT,
+				info   TEXT DEFAULT NULL
+			)
+		""")
+		conn.executemany("INSERT INTO taxa (id, parent) VALUES (?, ?)", taxa)
 
-def lookup_clades():
-	# Use the opentreeoflife.org API to get lookup each clade.
+def lookup_taxa(conn):
+	# Use the opentreeoflife.org API to get lookup each taxon.
 	# See https://github.com/OpenTreeOfLife/germinator/wiki/Open-Tree-of-Life-Web-APIs
-	print("Looking up clades...")
+	print("Looking up taxa...")
 	url = f"{OTT_API_URL}/taxonomy/taxon_info"
 	opener = request.build_opener(request.HTTPSHandler())
 	headers = {"Content-Type": "application/json"}
 	pattern = re.compile(r"^ott\d+$")
-	total = len(clades)
-	count = 0
-	seconds = 0
-	for index, clade in enumerate(clades):
+	total = conn.execute("SELECT COUNT(*) FROM taxa WHERE info IS NULL").fetchone()[0]
+	new_taxa = conn.execute("SELECT id FROM taxa WHERE info IS NULL")
+	for index, (taxon_id,) in enumerate(new_taxa, start=1):
 
-		# Show progress every second.
-		if seconds != int(time()):
-			percent = (index / len(clades)) * 100
-			print(f"   Processing clade {index} of {len(clades)} ({percent:.1f}%)", end="\r", flush=True)
-			seconds = int(time())
+		# Show progress in the console.
+		percent = (index / total) * 100
+		print(f"   Processing taxon {index} of {total} ({percent:.2f}%)", end="\r", flush=True)
 
-		# Save periodically just in case.
-		if count > 99:
-			save_clades()
-			count = 0
+		# Avoid entries with a composite label i.e. it's not in the OTT dataset.
+		if not pattern.match(taxon_id):
+			conn.execute(
+				"UPDATE taxa SET info=? WHERE id=?",
+				(json.dumps({"name": "Unknown Taxon"}), taxon_id)
+			)
+			continue
 
-		if clade.get("name"):
-			continue # Already have info on this clade.
-		if not pattern.match(clade["id"]):
-			clade["name"] = "Unknown Taxon"
-			continue # This clade has a composite label i.e. not in OTT dataset.
-		payload = json.dumps({"ott_id": int(clade["id"][3:])}).encode("utf-8")
+		# Look up data using the API and save the results to our database.
+		payload = json.dumps({"ott_id": int(taxon_id[3:])}).encode("utf-8")
 		req = request.Request(url, data=payload, headers=headers)
 		with opener.open(req) as response:
 			if response.status == 200:
-				taxon = json.load(response)
-				clade["name"] = taxon.get("name", "Unnamed Clade")
-				clade["extant"] = not any(flag in taxon.get("flags", []) for flag in ["extinct", "extinct_inherited"])
-				clade["other_names"] = json.dumps(taxon.get("synonyms"))
-				clade["description"] = "\n".join([
-					"Rank: " + taxon.get("rank"),
-					"Sources: " + ", ".join(taxon.get("tax_sources")),
-				])
-		count += 1
+				taxon_info = json.loads(response.read().decode("utf-8"))
+				conn.execute(
+					"UPDATE taxa SET info=? WHERE id=?",
+					(json.dumps(taxon_info), taxon_id)
+				)
+
+		# Commit in batches of 100 i.e. about every minute.
+		if index % 100 == 0:
+			conn.commit()
+
 		sleep(0.5) # Respectful API call velocity.
 
 def main():
-	if not load_clades():
+	conn = sqlite3.connect(DB_FILE)
+	conn.execute("PRAGMA journal_mode=WAL;")
+	if not db_exists(conn):
 		download_tree()
-		process_tree()
-		save_clades()
+		taxa = process_tree()
+		db_create(conn, taxa)
 	try:
-		lookup_clades()
+		lookup_taxa(conn)
 	except KeyboardInterrupt:
 		print('\nAborted!')
 		exit(130) # Our job is incomplete, but the script can be safely run again to resume.
-	save_clades()
+	conn.close()
 	print("Done!")
 
 if __name__ == "__main__":

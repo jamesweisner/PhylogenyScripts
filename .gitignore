@@ -1,2 +1,5 @@
 *.tre
 *.csv
+*.db-wal
+*.db-shm
+*.db
