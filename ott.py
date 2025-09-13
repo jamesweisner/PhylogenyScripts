@@ -3,7 +3,7 @@ import csv
 import json
 import sqlite3
 from sys import exit
-from time import sleep, time
+from time import sleep
 from pathlib import Path
 from urllib import request
 from urllib.request import urlretrieve
